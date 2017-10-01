@@ -11,6 +11,10 @@ import (
 	"syscall"
 )
 
+const (
+    quitFlag = "5d659f81-f6c2-4229-82cf-66e01b7940cd"
+)
+
 // LimitWorker LimitWorker is used to dynamically increase or decrease the number of workers.
 type LimitWorker interface {
 	Dying() <-chan struct{}
@@ -35,7 +39,7 @@ type limitWorker struct {
 	termOk  int
 	lock    sync.Mutex
 
-	cmder     *os.File
+	cmder     string
 	cmderQuit chan struct{}
 }
 
@@ -49,7 +53,7 @@ type limitWorker struct {
 func New(num int, cmder, lf string, fn Fn) (LimitWorker, error) {
 	logFile, err := os.OpenFile(lf, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
-        return nil, fmt.Errorf("open log file(%s) failed, err: %s", lf, err)
+        return nil, fmt.Errorf("open log(%s) failed, err: %s", lf, err)
 	}
 	logger := log.New(logFile, "", log.LstdFlags|log.Lshortfile)
 
@@ -58,13 +62,6 @@ func New(num int, cmder, lf string, fn Fn) (LimitWorker, error) {
 		logFile.Close()
         return nil, fmt.Errorf("Mkfifo(%s) failed, err: %s", cmder, err)
 	}
-
-    c, err := os.OpenFile(cmder, os.O_RDWR | syscall.O_NONBLOCK, 0644)
-    if err != nil {
-		logFile.Close()
-        return nil, fmt.Errorf("open cmder file(%s) failed, err: %s",
-                               cmder, err)
-    }
 
 	lw := &limitWorker{
 		log     : logger,
@@ -79,7 +76,7 @@ func New(num int, cmder, lf string, fn Fn) (LimitWorker, error) {
 		termOk  : 0,
 		lock    : sync.Mutex{},
 
-		cmder     : c,
+		cmder     : cmder,
 		cmderQuit : make(chan struct{}),
 	}
 
@@ -128,7 +125,15 @@ func (lw *limitWorker) run(fn Fn) {
 	}
 
 	if lw.running == 0 {
-        lw.cmderQuit<-struct{}{}
+        c, err := os.OpenFile(lw.cmder, os.O_WRONLY, 0644)
+        if err != nil {
+            lw.log.Printf("open cmder(%s) failed, err: %s", lw.cmder, err)
+        } else {
+            _, err := c.WriteString(quitFlag)
+            if err != nil {
+                lw.log.Printf("write data to cmder failed, err: %s", err)
+            }
+        }
         <-lw.cmderQuit
         close(lw.done)
 	}
@@ -139,37 +144,18 @@ func (lw *limitWorker) run(fn Fn) {
 func (lw *limitWorker) ctrl() {
     defer close(lw.cmderQuit)
 
-    fd := int(lw.cmder.Fd())
-    rfds := &syscall.FdSet{}
     buf := make([]byte, 1024)
     for {
-        fdZERO(rfds)
-        fdSET(rfds, fd)
-
-        timeout := syscall.Timeval{ Sec: 0, Usec: 20 * 1000 }
-        n, err := syscall.Select(fd + 1, rfds, nil, nil, &timeout)
+        c, err := os.OpenFile(lw.cmder, os.O_RDONLY, 0644)
         if err != nil {
-            lw.log.Printf("syscall.Select() failed, err: %s", err)
+            lw.log.Printf("open cmder(%s) failed, err: %s", lw.cmder, err)
             continue
         }
 
-        quit := false
-        select {
-        case <-lw.cmderQuit: quit = true
-        default:
-        }
-        if quit {
-            lw.log.Println("job finish, cmder quit now ...")
-            break
-        }
-
-        // timeout
-        if n == 0 { continue }
-
-        n, err = lw.cmder.Read(buf)
+        n, err := c.Read(buf)
         if err != nil {
-            lw.log.Printf("read data from cmder failed, err: %s. cmder quit now ...", err)
-            break
+            lw.log.Printf("read data from cmder failed, err: %s", err)
+            continue
         }
 
         cmd := strings.Trim(string(buf[:n]), "\r\n")
@@ -178,6 +164,8 @@ func (lw *limitWorker) ctrl() {
                           lw.running, lw.termErr, lw.termOk)
             continue
         }
+
+        if cmd == quitFlag { break }
 
         delta, err := strconv.Atoi(cmd)
         if err != nil {
@@ -205,6 +193,8 @@ func (lw *limitWorker) ctrl() {
 
         lw.log.Printf("delta: %+d", delta)
     }
+
+    lw.log.Println("cmder quit now ...")
 }
 
 func (lw *limitWorker) Dying() <-chan struct{} {
@@ -228,7 +218,6 @@ func (lw *limitWorker) Wait() {
 func (lw *limitWorker) Close() {
     lw.Kill()
 	lw.logFile.Close()
-    lw.cmder.Close()
 }
 
 func fdSET(p *syscall.FdSet, i int) {
